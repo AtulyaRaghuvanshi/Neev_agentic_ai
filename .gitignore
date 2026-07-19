@@ -1,0 +1,83 @@
+# Dependencies and package-manager state
+/node_modules/
+/.pnp/
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+.pnpm-store/
+
+# Secrets and local environment overrides
+.env*
+!.env.example
+.dev.vars*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Framework and deployment output
+/.next/
+/out/
+/dist/
+/.netlify/
+/.vercel/
+/.wrangler/
+/.sites-runtime/
+/.open-next/
+/outputs/
+/work/
+
+# Local agent/tool state
+/.agents/
+/.codex/
+
+# Build and tool caches
+*.tsbuildinfo
+.eslintcache
+.stylelintcache
+/.cache/
+/.parcel-cache/
+/.turbo/
+/tmp/
+/temp/
+
+# Tests and reports
+/coverage/
+/test-results/
+/playwright-report/
+/.nyc_output/
+
+# Local databases and emulator files
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Downloaded OCR language data
+/*.traineddata
+
+# Logs and process files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.pid
+*.pid.lock
+
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Next.js generates this file during builds
+next-env.d.ts
