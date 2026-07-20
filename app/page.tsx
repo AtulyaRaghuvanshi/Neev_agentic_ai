@@ -39,12 +39,16 @@ type PlanStep = {
   url?: string;
   source?: string;
   actions?: { kind: "document" | "locator"; label: string; url?: string; artifact?: "affidavit" }[];
-  basis: "rule" | "ai";
+  basis: "rule" | "ai" | "fallback";
   state: "ready" | "locked" | "complete";
 };
 
 type ApiResponse<T> = { data?: T; error?: string };
 type InterviewQuestion = { key: string; title: string; help: string; type: string; when?: string };
+
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
 
 const copy = {
   en: {
@@ -56,7 +60,7 @@ const copy = {
     login: "Continue securely",
     create: "Create an account",
     switchLogin: "Already have an account? Sign in",
-    demo: "Explore the guided demo",
+    demo: "",
     privacy: "Sensitive documents are private to your account. Neev never makes a legal decision for you.",
     myCases: "My cases",
     welcome: "Good morning",
@@ -89,7 +93,7 @@ const copy = {
     login: "सुरक्षित रूप से जारी रखें",
     create: "नया खाता बनाएँ",
     switchLogin: "पहले से खाता है? साइन इन करें",
-    demo: "निर्देशित डेमो देखें",
+    demo: "",
     privacy: "संवेदनशील दस्तावेज़ आपके खाते तक सीमित रहते हैं। नींव आपके लिए कानूनी निर्णय नहीं लेता।",
     myCases: "मेरे केस",
     welcome: "नमस्ते",
@@ -149,9 +153,9 @@ function shortCaseId() {
 }
 
 async function api<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, { ...options, headers: { ...(options?.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...options?.headers } });
+  const response = await fetch(url, { ...options, credentials: "include", cache: "no-store", headers: { ...(options?.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...options?.headers } });
   const json = (await response.json()) as ApiResponse<T>;
-  if (!response.ok || json.error) throw new Error(json.error || "Request failed");
+  if (!response.ok || json.error) throw new ApiError(json.error || "Request failed", response.status);
   return json.data as T;
 }
 
@@ -188,10 +192,11 @@ export default function Home() {
         };
         setCases([demoCase]); setView("cases"); return;
       }
-      const result = await api<{ cases: CaseRecord[] }>(registering ? "/api/auth/register" : "/api/auth/login", {
+      await api<{ cases: CaseRecord[] }>(registering ? "/api/auth/register" : "/api/auth/login", {
         method: "POST", body: JSON.stringify(credentials),
       });
-      setCases(result.cases); setView("cases");
+      const verified = await api<{ cases: CaseRecord[] }>("/api/cases");
+      setCases(verified.cases); setView("cases");
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to continue"); }
     finally { setBusy(false); }
   }
@@ -263,7 +268,7 @@ function AuthScreen({ language, setLanguage, registering, setRegistering, creden
         {notice && <p className="error-note">{notice}</p>}
         <button className="primary-button full" disabled={busy} onClick={() => authenticate()}>{busy ? "…" : registering ? t.create : t.login}<span>→</span></button>
         <button className="text-button" onClick={() => setRegistering(!registering)}>{registering ? t.switchLogin : t.create}</button>
-        <div className="or"><span>{language === "en" ? "or" : "या"}</span></div><button className="secondary-button full" onClick={() => authenticate(true)}>{t.demo}</button>
+        <div className="or"><span>{language === "en" ? "" : ""}</span></div><button className="secondary-button full" onClick={() => authenticate(true)}>{t.demo}</button>
         <p className="privacy-note">◈ {t.privacy}</p>
       </div>
     </section>
@@ -345,21 +350,25 @@ function DocumentUpload({ caseRecord, language, onSave, onBack, onComplete }: { 
   async function localImageText(file: File) {
     if (!file.type.startsWith("image/")) return { text: "", confidence: 0, rotation: 0 };
     try {
-      const { createWorker } = await import("tesseract.js");
-      const worker = await createWorker(["eng", "hin"]);
+      const { createWorker, PSM } = await import("tesseract.js"); const bitmap = await createImageBitmap(file);
+      const scale = Math.max(bitmap.width, bitmap.height) < 2200 ? Math.min(2.25, 2200 / Math.max(bitmap.width, bitmap.height)) : 1;
+      const enhanced = document.createElement("canvas"); enhanced.width = Math.round(bitmap.width * scale); enhanced.height = Math.round(bitmap.height * scale);
+      const context = enhanced.getContext("2d", { willReadFrequently: true }); if (!context) { bitmap.close(); throw new Error("Canvas is unavailable"); }
+      context.fillStyle = "white"; context.fillRect(0, 0, enhanced.width, enhanced.height); context.imageSmoothingEnabled = true; context.imageSmoothingQuality = "high"; context.drawImage(bitmap, 0, 0, enhanced.width, enhanced.height); bitmap.close();
+      const pixels = context.getImageData(0, 0, enhanced.width, enhanced.height); const histogram = new Array<number>(256).fill(0);
+      for (let index = 0; index < pixels.data.length; index += 4) { const luminance = Math.round(0.299 * pixels.data[index] + 0.587 * pixels.data[index + 1] + 0.114 * pixels.data[index + 2]); histogram[luminance]++; const contrasted = Math.max(0, Math.min(255, (luminance - 128) * 1.65 + 128)); pixels.data[index] = contrasted; pixels.data[index + 1] = contrasted; pixels.data[index + 2] = contrasted; }
+      context.putImageData(pixels, 0, 0);
+      const total = enhanced.width * enhanced.height; let sum = 0; for (let value = 0; value < 256; value++) sum += value * histogram[value];
+      let background = 0; let foregroundSum = 0; let bestVariance = -1; let threshold = 170;
+      for (let value = 0; value < 256; value++) { background += histogram[value]; if (!background) continue; const foreground = total - background; if (!foreground) break; foregroundSum += value * histogram[value]; const meanBackground = foregroundSum / background; const meanForeground = (sum - foregroundSum) / foreground; const variance = background * foreground * (meanBackground - meanForeground) ** 2; if (variance > bestVariance) { bestVariance = variance; threshold = value; } }
+      const binary = document.createElement("canvas"); binary.width = enhanced.width; binary.height = enhanced.height; const binaryContext = binary.getContext("2d"); if (!binaryContext) throw new Error("Canvas is unavailable"); const binaryPixels = new ImageData(new Uint8ClampedArray(pixels.data), enhanced.width, enhanced.height);
+      for (let index = 0; index < binaryPixels.data.length; index += 4) { const value = binaryPixels.data[index] < threshold ? 0 : 255; binaryPixels.data[index] = value; binaryPixels.data[index + 1] = value; binaryPixels.data[index + 2] = value; binaryPixels.data[index + 3] = 255; } binaryContext.putImageData(binaryPixels, 0, 0);
+      const worker = await createWorker(["eng", "hin"]); const candidates: { text: string; confidence: number; rotation: number }[] = [];
       try {
-        let best = { ...(await worker.recognize(file)).data, rotation: 0 };
-        if (best.confidence < 65 && "createImageBitmap" in window) {
-          const bitmap = await createImageBitmap(file);
-          try {
-            for (const rotation of [90, -90, 180]) {
-              const sideways = Math.abs(rotation) === 90; const canvas = document.createElement("canvas"); canvas.width = sideways ? bitmap.height : bitmap.width; canvas.height = sideways ? bitmap.width : bitmap.height;
-              const context = canvas.getContext("2d"); if (!context) continue; context.translate(canvas.width / 2, canvas.height / 2); context.rotate(rotation * Math.PI / 180); context.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
-              const rotated = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, file.type, 0.95)); if (!rotated) continue;
-              const candidate = { ...(await worker.recognize(rotated)).data, rotation }; if (candidate.confidence > best.confidence) best = candidate;
-            }
-          } finally { bitmap.close(); }
-        }
+        await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO, preserve_interword_spaces: "1", user_defined_dpi: "300" });
+        for (const image of [enhanced, binary]) { const data = (await worker.recognize(image, { rotateAuto: true })).data; candidates.push({ text: data.text, confidence: data.confidence, rotation: Math.round((data.rotateRadians || 0) * 180 / Math.PI) }); }
+        function score(candidate: { text: string; confidence: number }) { const text = candidate.text; const labels = text.match(/\b(?:name|father|mother|birth|dob|permanent account number|income tax)\b/gi)?.length || 0; const identifiers = /\b[A-Z]{5}\d{4}[A-Z]\b/.test(text) ? 25 : 0; const dates = /\b\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4}\b/.test(text) ? 18 : 0; const noisy = (text.match(/[^\p{L}\p{N}\s.,:/()'\-]/gu)?.length || 0) / Math.max(1, text.length); return candidate.confidence + Math.min(30, labels * 5) + identifiers + dates - noisy * 80; }
+        const best = candidates.sort((left, right) => score(right) - score(left))[0] || { text: "", confidence: 0, rotation: 0 };
         return { text: best.text.slice(0, 30_000), confidence: best.confidence, rotation: best.rotation };
       }
       finally { await worker.terminate(); }
@@ -371,10 +380,15 @@ function DocumentUpload({ caseRecord, language, onSave, onBack, onComplete }: { 
       const form = new FormData(); form.append("file", file); form.append("caseId", caseRecord.id); form.append("type", docType); form.append("language", language);
       const localOcr = await localImageText(file); if (localOcr.text) form.append("localText", localOcr.text); form.append("localOcrConfidence", String(localOcr.confidence)); form.append("localOcrRotation", String(localOcr.rotation));
       try { parsed.push(await api<DocumentRecord>("/api/documents", { method: "POST", body: form })); }
-      catch {
+      catch (cause) {
+        if (cause instanceof ApiError && cause.status === 401) {
+          setError("Your browser did not send the session cookie. Return to All cases, sign out, and sign in again.");
+          setBusy(false); return;
+        }
         const { parseDocumentLocally } = await import("@/lib/document-parser");
         const local = await parseDocumentLocally(await file.arrayBuffer(), file.type, docType, localOcr.text);
-        parsed.push({ id: crypto.randomUUID(), type: docType, fileName: file.name, status: "review", confidence: local.confidence, fields: { ...local.fields, signature_present: String(local.signature.present), stamp_present: String(local.stamp.present) }, issue: [...local.notes, "Parsed locally only; sign in to save the original file."].join(" · ") });
+        const reason = cause instanceof Error ? cause.message : "Server processing failed";
+        parsed.push({ id: crypto.randomUUID(), type: docType, fileName: file.name, status: "review", confidence: local.confidence, fields: { ...local.fields, signature_present: String(local.signature.present), stamp_present: String(local.stamp.present) }, issue: [...local.notes, `Parsed locally only; the original file was not saved. Server error: ${reason}`].join(" · ") });
       }
     }
     const next = { ...caseRecord, plan: undefined, documents: [...(caseRecord.documents || []), ...parsed], status: "Evidence review", updatedAt: Date.now() }; await onSave(next); setBusy(false); onComplete();
@@ -398,12 +412,14 @@ function EvidenceReview({ caseRecord, language, onSave, onBack, onComplete }: { 
 
 function Pathway({ caseRecord, language, onSave, onBack }: { caseRecord: CaseRecord; language: Language; onSave: (c: CaseRecord) => void; onBack: () => void }) {
   const t = copy[language]; const savedPlan = caseRecord.plan?.length && caseRecord.plan.every((step) => step.basis) ? caseRecord.plan : []; const [busy, setBusy] = useState(!savedPlan.length); const [plan, setPlan] = useState<PlanStep[]>(savedPlan); const [notice, setNotice] = useState("");
-  useEffect(() => { if (plan.length) return; api<{ steps: PlanStep[] }>("/api/plan", { method: "POST", body: JSON.stringify({ caseRecord: { ...caseRecord, plan: undefined } }) }).then(({ steps }) => { setPlan(steps); onSave({ ...caseRecord, plan: steps, updatedAt: Date.now() }); }).catch((cause) => setNotice(cause instanceof Error ? cause.message : (language === "en" ? "Could not build a pathway." : "मार्ग तैयार नहीं हो सका।"))).finally(() => setBusy(false)); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (plan.length) return; api<{ steps: PlanStep[] }>("/api/plan", { method: "POST", body: JSON.stringify({ caseRecord: { ...caseRecord, plan: undefined } }) }).then(({ steps }) => { setPlan(steps); onSave({ ...caseRecord, plan: steps, updatedAt: Date.now() }); }).catch((cause) => setNotice(cause instanceof ApiError && cause.status === 401 ? "Your session is no longer available. Return to All cases, sign out, and sign in again." : cause instanceof Error ? cause.message : (language === "en" ? "Could not build a pathway." : "मार्ग तैयार नहीं हो सका।"))).finally(() => setBusy(false)); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   function complete(id: string) { const index = plan.findIndex((s) => s.id === id); const next = plan.map((step, i) => i === index ? { ...step, state: "complete" as const } : i === index + 1 ? { ...step, state: "ready" as const } : step); setPlan(next); onSave({ ...caseRecord, plan: next, updatedAt: Date.now() }); }
   async function affidavit() { setNotice(""); try { const response = await fetch("/api/affidavit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ caseRecord, language }) }); if (!response.ok) throw new Error(); const blob = await response.blob(); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = `${caseRecord.id}-draft-affidavit.pdf`; anchor.click(); URL.revokeObjectURL(url); } catch { setNotice(language === "en" ? "PDF generation is unavailable in demo mode. Create an account to generate a case-linked draft." : "डेमो में PDF उपलब्ध नहीं है। केस से जुड़ा मसौदा बनाने के लिए खाता बनाएँ।"); } }
   function copyChecklist() { navigator.clipboard.writeText(plan.map((step, index) => [`${index + 1}. ${step.title}`, step.description, step.office ? `Office: ${step.office}` : ""].filter(Boolean).join("\n")).join("\n\n")).then(() => setNotice(language === "en" ? "Checklist copied." : "चेकलिस्ट कॉपी हो गई।")).catch(() => setNotice(language === "en" ? "Could not copy the checklist." : "चेकलिस्ट कॉपी नहीं हो सकी।")); }
-  const actions = plan.flatMap((step) => step.actions || []).filter((action, index, rows) => rows.findIndex((row) => row.kind === action.kind && row.label === action.label && row.url === action.url) === index); const isAi = plan.some((step) => step.basis === "ai");
-  return <div className="stage-card wide"><StageHeader eyebrow={isAi ? (language === "en" ? "AI-GENERATED CHECKLIST · VERIFY LOCALLY" : "AI चेकलिस्ट · स्थानीय पुष्टि आवश्यक") : t.officialOnly} title={language === "en" ? `Shortest supported path to ${caseRecord.service}` : `${caseRecord.service} तक सबसे छोटा समर्थित मार्ग`} help={isAi ? (language === "en" ? `No matching verified rule was available. This is one constrained checklist based on your evidence and ${caseRecord.state}; confirm every step with the named authority.` : "मिलान वाला सत्यापित नियम उपलब्ध नहीं था। हर कदम संबंधित अधिकारी से सत्यापित करें।") : (language === "en" ? `Built from your verified evidence, ${caseRecord.state || "state"} rules and official government sources. Only the current actionable step is unlocked.` : "आपके प्रमाण, राज्य नियम और आधिकारिक सरकारी स्रोतों से तैयार। केवल वर्तमान कदम खुला है।")} language={language} speakText={language === "en" ? "Your supported pathway is ready" : "आपका मार्ग तैयार है"} />
+  const actions = plan.flatMap((step) => step.actions || []).filter((action, index, rows) => rows.findIndex((row) => row.kind === action.kind && row.label === action.label && row.url === action.url) === index); const isAi = plan.some((step) => step.basis === "ai"); const isFallback = plan.some((step) => step.basis === "fallback");
+  const pathwayEyebrow = isFallback ? (language === "en" ? "SAFE FALLBACK · VERIFY WITH THE AUTHORITY" : "सुरक्षित वैकल्पिक कदम · अधिकारी से पुष्टि करें") : isAi ? (language === "en" ? "" : "") : t.officialOnly;
+  const pathwayHelp = isFallback ? (language === "en" ? "The planner service was unavailable, so Neev preserved your progress and provided the safest next verification step." : "मार्ग सेवा उपलब्ध नहीं थी, इसलिए नींव ने आपकी प्रगति सुरक्षित रखी और अगला सुरक्षित सत्यापन कदम दिया।") : isAi ? (language === "en" ? `No matching verified rule was available. This is one constrained checklist based on your evidence and ${caseRecord.state}; confirm every step with the named authority.` : "मिलान वाला सत्यापित नियम उपलब्ध नहीं था। हर कदम संबंधित अधिकारी से सत्यापित करें।") : (language === "en" ? `Built from your verified evidence, ${caseRecord.state || "state"} rules and official government sources. Only the current actionable step is unlocked.` : "आपके प्रमाण, राज्य नियम और आधिकारिक सरकारी स्रोतों से तैयार। केवल वर्तमान कदम खुला है।");
+  return <div className="stage-card wide"><StageHeader eyebrow={pathwayEyebrow} title={language === "en" ? `Shortest supported path to ${caseRecord.service}` : `${caseRecord.service} तक सबसे छोटा समर्थित मार्ग`} help={pathwayHelp} language={language} speakText={language === "en" ? "Your supported pathway is ready" : "आपका मार्ग तैयार है"} />
     {busy ? <div className="planner-loading"><span /><p>{language === "en" ? "Rule agent is checking evidence dependencies…" : "नियम एजेंट प्रमाण निर्भरता जाँच रहा है…"}</p></div> : plan.length ? <><div className="path-summary"><div><span>⌘</span><p><strong>{plan.filter((s) => s.state === "complete").length}/{plan.length}</strong><small>{language === "en" ? "steps completed" : "कदम पूर्ण"}</small></p></div><div><span>◷</span><p><strong>{Math.max(0, plan.length - plan.filter((s) => s.state === "complete").length)}</strong><small>{language === "en" ? "actions remaining" : "कार्य बाकी"}</small></p></div><div><span>◈</span><p><strong>{caseRecord.documents?.length || 0}</strong><small>{language === "en" ? "evidence items" : "प्रमाण"}</small></p></div></div>
       <div className="plan-list">{plan.map((step, index) => <article className={`plan-step ${step.state}`} key={step.id}><div className="step-number">{step.state === "complete" ? "✓" : step.state === "locked" ? "◇" : index + 1}</div><div className="step-content"><header><div><p>STEP {index + 1} · {step.state.toUpperCase()}</p><h3>{step.title}</h3></div>{step.office && <span className="office-chip">⌖ {step.office}</span>}</header>{step.description && <p>{step.description}</p>}{step.source && <a href={step.source} target="_blank" rel="noreferrer">↗ {language === "en" ? "Check official source" : "आधिकारिक स्रोत देखें"}</a>}<div className="step-buttons">{step.url && <a className="secondary-button" href={step.url} target="_blank" rel="noreferrer">{language === "en" ? "Open service" : "सेवा खोलें"} ↗</a>}{step.state === "ready" && <button className="primary-button" onClick={() => complete(step.id)}>{language === "en" ? "I completed this step" : "मैंने यह कदम पूरा किया"} ✓</button>}</div></div></article>)}</div>
       <div className="agent-actions"><button className="secondary-button" onClick={copyChecklist}>☷ {language === "en" ? "Copy submission checklist" : "जमा चेकलिस्ट कॉपी करें"}</button>{actions.map((action) => action.kind === "document" && action.artifact === "affidavit" ? <button key={`${action.kind}-${action.label}`} className="secondary-button" onClick={affidavit}>▤ {action.label}</button> : action.kind === "locator" && action.url ? <button key={`${action.kind}-${action.label}`} className="secondary-button" onClick={() => window.open(action.url, "_blank", "noopener,noreferrer")}>⌖ {action.label}</button> : null)}<span>{actions.length ? (language === "en" ? "Actions shown here come from this checklist only." : "यहाँ केवल इसी चेकलिस्ट के कार्य दिखते हैं।") : (language === "en" ? "No document-generation or centre action is required by this checklist." : "इस चेकलिस्ट में दस्तावेज़ बनाने या केंद्र खोजने की आवश्यकता नहीं है।")}</span></div></> : null}
@@ -415,5 +431,5 @@ function CaseAssistant({ open, setOpen, language, messages, setMessages, value, 
   const t = copy[language]; const [busy, setBusy] = useState(false);
   async function send() { const text = value.trim(); if (!text || busy) return; const next = [...messages, { from: "user" as const, text }]; setMessages(next); setValue(""); setBusy(true); try { const result = await api<{ answer: string }>("/api/ai", { method: "POST", body: JSON.stringify({ task: "chat", language, text, caseRecord }) }); setMessages([...next, { from: "agent", text: result.answer }]); } catch { setMessages([...next, { from: "agent", text: language === "en" ? "I can explain the visible step. For a new legal claim, please use the official source link or connect a Gemini/Groq key." : "मैं दिख रहे कदम को समझा सकता हूँ। नए कानूनी दावे के लिए आधिकारिक स्रोत देखें या AI कुंजी जोड़ें।" }]); } finally { setBusy(false); } }
   if (!open) return <button className="chat-fab" onClick={() => setOpen(true)}>✦</button>;
-  return <aside className="assistant-panel"><header><span className="agent-avatar">न</span><p><strong>{t.assistant}</strong><small><i /> {t.assistantStatus}</small></p><button onClick={() => setOpen(false)}>×</button></header><div className="assistant-scope">◈ {language === "en" ? "Answers stay grounded in this case" : "उत्तर इसी केस पर आधारित हैं"}</div><div className="messages">{messages.map((message, i) => <div className={message.from} key={i}>{message.text}</div>)}{busy && <div className="agent typing">•••</div>}</div><div className="quick-prompts"><button onClick={() => setValue(language === "en" ? "Why is the next step locked?" : "अगला कदम लॉक क्यों है?")}>{language === "en" ? "Why is this locked?" : "यह लॉक क्यों है?"}</button><button onClick={() => setValue(language === "en" ? "Explain this in simple words" : "सरल शब्दों में समझाएँ")}>{language === "en" ? "Explain simply" : "सरल समझाएँ"}</button></div><div className="chat-input"><textarea rows={2} value={value} onChange={(e) => setValue(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder={t.ask} /><button onClick={send}>↑</button></div><small className="ai-note">AI may make mistakes. Verify official links.</small></aside>;
+  return <aside className="assistant-panel"><header><span className="agent-avatar">न</span><p><strong>{t.assistant}</strong><small><i /> {t.assistantStatus}</small></p><button onClick={() => setOpen(false)}>×</button></header><div className="assistant-scope">◈ {language === "en" ? "Answers stay grounded in this case" : "उत्तर इसी केस पर आधारित हैं"}</div><div className="messages">{messages.map((message, i) => <div className={message.from} key={i}>{message.text}</div>)}{busy && <div className="agent typing">•••</div>}</div><div className="quick-prompts"><button onClick={() => setValue(language === "en" ? "Explain this in simple words" : "सरल शब्दों में समझाएँ")}>{language === "en" ? "Explain simply" : "सरल समझाएँ"}</button></div><div className="chat-input"><textarea rows={2} value={value} onChange={(e) => setValue(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder={t.ask} /><button onClick={send}>↑</button></div><small className="ai-note">AI may make mistakes. Verify official links.</small></aside>;
 }

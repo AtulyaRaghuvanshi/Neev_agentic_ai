@@ -4,7 +4,7 @@ import { runTextAI } from "@/lib/server";
 import { parseTodoLines } from "@/lib/domain";
 
 export type PlanAction = { kind: "document" | "locator"; label: string; url?: string; artifact?: "affidavit" };
-export type PlanStep = { id: string; title: string; description: string; office: string; url?: string; source?: string; actions?: PlanAction[]; basis: "rule" | "ai"; state: "ready" | "locked" | "complete" };
+export type PlanStep = { id: string; title: string; description: string; office: string; url?: string; source?: string; actions?: PlanAction[]; basis: "rule" | "ai" | "fallback"; state: "ready" | "locked" | "complete" };
 type CaseRecord = { id: string; service: string; state: string; district: string; language: "en" | "hi"; profile: Record<string, unknown>; documents?: unknown[] };
 type AgentOutputs = {
   documentAgent: { available: boolean; artifact?: "draft-affidavit-pdf" };
@@ -44,19 +44,41 @@ function toPlanStep(rule: RuleEntry, language: "en" | "hi", state: PlanStep["sta
 }
 
 const retrieveNode = (state: typeof PathwayState.State) => ({ rules: retrieveRules(state.caseRecord.service, state.caseRecord.state, JSON.stringify(state.caseRecord.profile)) });
+function safeFallback(caseRecord: CaseRecord): PlanStep[] {
+  const hi = caseRecord.language === "hi";
+  const offices: Record<string, string> = {
+    "Voter ID": "Electoral Registration Officer / District Election Office",
+    "PAN card": "Authorised PAN service centre",
+    "Ration card": "District Food and Civil Supplies office",
+    "Aadhaar enrolment": "Aadhaar enrolment centre",
+    "Correct a name": "Authority that issued the record",
+  };
+  return [{
+    id: "fallback-confirm-requirements",
+    title: hi ? "जारीकर्ता कार्यालय से वर्तमान आवश्यकताएँ सत्यापित करें" : `Confirm the current ${caseRecord.service} requirements`,
+    description: hi
+      ? "अपने पुष्टि किए हुए प्रमाण साथ ले जाएँ। आवेदन से पहले पात्रता, स्वीकार्य दस्तावेज़ और अगला कदम संबंधित अधिकारी से लिखित या आधिकारिक रूप में जाँचें।"
+      : "Take your confirmed evidence and ask the issuing authority to verify eligibility, accepted documents, and the next filing step before you apply.",
+    office: offices[caseRecord.service] || `${caseRecord.service} issuing authority`,
+    basis: "fallback",
+    state: "ready",
+  }];
+}
 const planNode = async (state: typeof PathwayState.State) => {
   const deterministic = buildFromRules(state.caseRecord, state.rules); if (deterministic.length) return { steps: deterministic, retrievalMode: "structured-official-rules" as const };
   const documents = state.caseRecord.documents || [];
   const heldDocuments = [...new Set([...(state.caseRecord.profile.documents as string[] || []), ...documents.map((document) => String((document as { type?: string }).type || "")).filter(Boolean)])];
   const limitations = [...new Set([String(state.caseRecord.profile.story || "").trim(), ...documents.map((document) => String((document as { issue?: string }).issue || "").trim())].filter(Boolean))];
-  const answer = await runTextAI({ prompt: `I currently have these documents: ${heldDocuments.length ? heldDocuments.join(", ") : "none confirmed"}.
+  let answer: string;
+  try { answer = await runTextAI({ prompt: `I currently have these documents: ${heldDocuments.length ? heldDocuments.join(", ") : "none confirmed"}.
 I want to obtain: ${state.caseRecord.service}.
 My location is: ${state.caseRecord.district || "district not provided"}, ${state.caseRecord.state || "state not provided"}.
 My limitations, if any: ${limitations.length ? limitations.join("; ") : "none provided"}.
 
-Give only ONE route to obtain the requested document. Do not assume missing facts. Do not give alternatives. Do not over-explain. Return few short lines in the exact format "TODO: next move". No heading, introduction, conclusion, markdown table, or invented address/URL. If a missing fact prevents a reliable next move, make the first TODO tell me which relevant official authority must confirm it. Write in ${state.caseRecord.language === "hi" ? "Hindi" : "English"}.` });
+Give only ONE route to obtain the requested document. Do not assume missing facts. Do not give alternatives. Do not over-explain. Return few short lines in the exact format "TODO: next move". No heading, introduction, conclusion, markdown table, or invented address/URL. If a missing fact prevents a reliable next move, make the first TODO tell me which relevant official authority must confirm it. Write in ${state.caseRecord.language === "hi" ? "Hindi" : "English"}.` }); }
+  catch { return { retrievalMode: "ai-fallback" as const, steps: safeFallback(state.caseRecord), warnings: ["AI planning was unavailable; showing a safe authority-verification step."] }; }
   const todos = parseTodoLines(answer);
-  if (!todos.length) throw new Error("The AI planner returned no TODO steps");
+  if (!todos.length) return { retrievalMode: "ai-fallback" as const, steps: safeFallback(state.caseRecord), warnings: ["AI planning returned no usable steps; showing a safe authority-verification step."] };
   return { retrievalMode: "ai-fallback" as const, steps: todos.map((todo, index) => ({ id: `fallback-${index}`, title: todo, description: "", office: "", basis: "ai" as const, state: index === 0 ? "ready" as const : "locked" as const })) };
 };
 function official(url?: string) { if (!url) return undefined; try { const host = new URL(url).hostname; return host.endsWith(".gov.in") || host === "uidai.gov.in" || host.endsWith(".uidai.gov.in") || host === "bhuvan.nrsc.gov.in" ? url : undefined; } catch { return undefined; } }

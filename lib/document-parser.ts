@@ -28,6 +28,53 @@ function firstMatch(text: string, expressions: RegExp[]) {
   return "";
 }
 
+const identityKeys = new Set(["name", "date_of_birth", "address", "guardian_name", "document_number", "issuing_authority"]);
+function personName(value: string) {
+  if (value.length < 3 || value.length > 100 || /[\d/\\|]/.test(value)) return "";
+  if (/\b(?:name|father|mother|guardian|date|birth|dob|pan|income\s+tax)\b/i.test(value)) return "";
+  const letters = value.match(/\p{L}/gu)?.length || 0;
+  return letters >= 3 && letters / value.length >= 0.55 ? value : "";
+}
+function dateOfBirth(value: string) {
+  const numeric = value.match(/\b(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})\b/);
+  if (numeric) {
+    const day = Number(numeric[1]); const month = Number(numeric[2]); const year = Number(numeric[3]);
+    if (day >= 1 && day <= 31 && month >= 1 && month <= 12 && year >= 1900 && year <= new Date().getFullYear()) return numeric[0];
+  }
+  const words = value.match(/\b(\d{1,2})\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{4})\b/i);
+  return words ? words[0] : "";
+}
+function documentNumber(value: string, declaredType: string) {
+  const compact = value.toUpperCase().replace(/\s+/g, ""); const type = declaredType.toLowerCase();
+  if (type.includes("pan")) return /^[A-Z]{5}\d{4}[A-Z]$/.test(compact) ? compact : "";
+  if (type.includes("aadhaar")) return /^\d{12}$/.test(compact) ? compact.replace(/(\d{4})(?=\d)/g, "$1 ") : "";
+  if (type.includes("voter")) return /^[A-Z]{3}\d{7}$/.test(compact) ? compact : "";
+  return /^[\p{L}\d][\p{L}\d/._\-]{2,39}$/u.test(compact) ? compact : "";
+}
+
+/** Reject OCR label fragments and impossible identity values before review. */
+export function sanitizeExtractedFields(input: unknown, declaredType: string) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const fields: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(input)) {
+    const key = rawKey.replace(/[^a-z0-9_]/gi, "_").toLowerCase();
+    if (!identityKeys.has(key) || typeof rawValue !== "string") continue;
+    const value = clean(rawValue).slice(0, 500); let accepted = "";
+    if (key === "name" || key === "guardian_name") accepted = personName(value);
+    else if (key === "date_of_birth") accepted = dateOfBirth(value);
+    else if (key === "document_number") accepted = documentNumber(value, declaredType);
+    else if (key === "address") accepted = value.length >= 8 && !/\b(?:address|name|dob)\b/i.test(value) ? value : "";
+    else if (key === "issuing_authority") accepted = value.length >= 3 && !/[|]/.test(value) ? value : "";
+    if (accepted) fields[key] = accepted;
+  }
+  return fields;
+}
+
+export function mergeExtractedFields(primary: unknown, local: unknown, declaredType: string) {
+  // Vision extraction is primary; local OCR only fills a missing, independently valid field.
+  return { ...sanitizeExtractedFields(local, declaredType), ...sanitizeExtractedFields(primary, declaredType) };
+}
+
 function fieldsFromText(text: string, declaredType: string) {
   const fields: Record<string, string> = {};
   const name = labelled(text, ["name(?: of (?:student|candidate|holder))?", "student(?:'s)? name", "नाम"]);
@@ -52,11 +99,11 @@ function fieldsFromText(text: string, declaredType: string) {
         ? firstMatch(text, [/\b([A-Z]{3}\d{7})\b/])
         : labelled(text, ["(?:document|certificate|registration|roll|serial|admission) (?:no\\.?|number)", "क्रमांक", "पंजीकरण संख्या"]);
   if (number) fields.document_number = number;
-  return fields;
+  return sanitizeExtractedFields(fields, declaredType);
 }
 
 export async function parseDocumentLocally(bytes: ArrayBuffer, mimeType: string, declaredType: string, browserOcrText = ""): Promise<LocalExtraction> {
-  let text = browserOcrText.trim();
+  const text = browserOcrText.trim();
   const notes: string[] = [];
   void bytes; void mimeType;
 

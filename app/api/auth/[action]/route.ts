@@ -9,9 +9,9 @@ export async function POST(request: Request, context: Context) {
     const body = await request.json() as { accountId?: string; password?: string }; const accountId = body.accountId?.trim().toLowerCase() || ""; const password = body.password || "";
     if (!/^[a-z0-9][a-z0-9._-]{2,39}$/.test(accountId)) return Response.json({ error: "Account ID must be 3–40 letters, numbers, dots, dashes or underscores" }, { status: 400 });
     if (password.length < 8 || password.length > 128) return Response.json({ error: "Password must be 8–128 characters" }, { status: 400 });
-    const existing = await db.prepare("SELECT id, password_hash AS passwordHash, salt FROM accounts WHERE id = ?").bind(accountId).first<{ id: string; passwordHash: string; salt: string }>();
+    const existing = await db.prepare('SELECT id, password_hash AS "passwordHash", salt FROM accounts WHERE id = ?').bind(accountId).first<{ id: string; passwordHash: string; salt: string }>();
     if (action === "register") { if (existing) return Response.json({ error: "That Account ID is already in use" }, { status: 409 }); const salt = randomToken(16); await db.prepare("INSERT INTO accounts (id, password_hash, salt, created_at) VALUES (?, ?, ?, ?)").bind(accountId, await hashPassword(password, salt), salt, Date.now()).run(); }
-    else if (action === "login") { if (!existing || !constantTimeEqual(await hashPassword(password, existing.salt), existing.passwordHash)) return Response.json({ error: "Account ID or password is incorrect" }, { status: 401 }); }
+    else if (action === "login") { if (!existing || typeof existing.passwordHash !== "string" || typeof existing.salt !== "string" || !constantTimeEqual(await hashPassword(password, existing.salt), existing.passwordHash)) return Response.json({ error: "Account ID or password is incorrect" }, { status: 401 }); }
     else return Response.json({ error: "Unknown authentication action" }, { status: 404 });
     const session = await createSession(accountId); const rows = await db.prepare("SELECT * FROM cases WHERE account_id = ? ORDER BY updated_at DESC").bind(accountId).all<Record<string, unknown>>();
     return json({ cases: (rows.results || []).map(mapCase) }, action === "register" ? 201 : 200, { "Set-Cookie": session.cookie });

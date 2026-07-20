@@ -11,15 +11,13 @@ const DAY = 86_400_000;
 let databasePromise: Promise<D1> | null = null;
 function postgresPlaceholders(query: string) { let index = 0; return query.replace(/\?/g, () => `$${++index}`); }
 async function createNetlifyDatabase(): Promise<D1> {
-  const { getDatabase } = await import("@netlify/database");
+  const { neon } = await import("@neondatabase/serverless");
   const connectionString = process.env.NETLIFY_DB_URL || process.env.DATABASE_URL;
-  const connection = getDatabase(connectionString ? { connectionString } : undefined);
-  const prepare = (sql: string): D1Statement => {
+  if (!connectionString) throw new Error("Database is not configured. NETLIFY_DB_URL is missing.");
+  const client = neon(connectionString);
+  const prepare = (query: string): D1Statement => {
     let values: unknown[] = [];
-    const execute = async () => {
-      const result = await connection.pool.query(postgresPlaceholders(sql), values);
-      return result.rows as Record<string, unknown>[];
-    };
+    const execute = async () => await client.query(postgresPlaceholders(query), values) as Record<string, unknown>[];
     const statement: D1Statement = {
       bind: (...nextValues: unknown[]) => { values = nextValues; return statement; },
       first: async <T = Record<string, unknown>>() => (await execute())[0] as T | undefined || null,
@@ -90,7 +88,7 @@ export async function createSession(accountId: string) {
 }
 export async function sessionAccount(request: Request) {
   await ensureSchema(); const cookie = request.headers.get("cookie") || ""; const token = cookie.split(/;\s*/).find((part) => part.startsWith(`${SESSION_COOKIE}=`))?.split("=")[1]; if (!token) return null;
-  const row = await (await getDb()).prepare("SELECT account_id AS accountId FROM sessions WHERE token_hash = ? AND expires_at > ?").bind(await sha256(token), Date.now()).first<{ accountId: string }>(); return row?.accountId || null;
+  const row = await (await getDb()).prepare('SELECT account_id AS "accountId" FROM sessions WHERE token_hash = ? AND expires_at > ?').bind(await sha256(token), Date.now()).first<{ accountId: string }>(); return row?.accountId || null;
 }
 export async function requireAccount(request: Request) { const accountId = await sessionAccount(request); if (!accountId) throw new Response(JSON.stringify({ error: "Please sign in to continue" }), { status: 401, headers: { "Content-Type": "application/json" } }); return accountId; }
 export function clearSessionCookie() { return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`; }
@@ -103,13 +101,13 @@ function splitKeys(...values: (string | undefined)[]) { return values.flatMap((v
 function stripJson(text: string) { return text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim(); }
 function toBase64(buffer: ArrayBuffer) { const bytes = new Uint8Array(buffer); let binary = ""; for (let start = 0; start < bytes.length; start += 0x8000) binary += String.fromCharCode(...bytes.subarray(start, start + 0x8000)); return btoa(binary); }
 
-async function geminiResponse(key: string, model: string, prompt: string, image?: ArrayBuffer, mimeType?: string, jsonMode = false) {
+async function geminiResponse(key: string, model: string, prompt: string, image?: ArrayBuffer, mimeType?: string, jsonMode = false, signal?: AbortSignal) {
   const parts: Record<string, unknown>[] = [{ text: prompt }]; if (image) parts.push({ inline_data: { mime_type: mimeType || "image/jpeg", data: toBase64(image) } });
   const generationConfig: Record<string, unknown> = { temperature: 0.1 }; if (jsonMode) generationConfig.responseMimeType = "application/json";
-  return fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig }) });
+  return fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig }), signal });
 }
 
-async function groqResponse(key: string, model: string, prompt: string, image?: ArrayBuffer, mimeType?: string, jsonMode = false) {
+async function groqResponse(key: string, model: string, prompt: string, image?: ArrayBuffer, mimeType?: string, jsonMode = false, signal?: AbortSignal) {
   const isImage = Boolean(image && (mimeType || "").startsWith("image/"));
   const content: unknown = isImage ? [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: `data:${mimeType};base64,${toBase64(image!)}` } }] : prompt;
   const isQwen36 = model === "qwen/qwen3.6-27b";
@@ -118,19 +116,28 @@ async function groqResponse(key: string, model: string, prompt: string, image?: 
   const body: Record<string, unknown> = { model, messages, temperature: isQwen36 ? 0.7 : 0.1 };
   if (isQwen36) { body.reasoning_effort = "none"; body.reasoning_format = "hidden"; }
   if (jsonMode) body.response_format = { type: "json_object" };
-  return fetch("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return fetch("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
+}
+
+const AI_ATTEMPT_TIMEOUT_MS = 7_000;
+function attemptSignal(deadline: number) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("AI request deadline reached");
+  return AbortSignal.timeout(Math.min(AI_ATTEMPT_TIMEOUT_MS, remaining));
 }
 
 export type AITrace = { selected?: { provider: "gemini" | "groq" | "local"; model: string }; attempts: { provider: "gemini" | "groq"; model: string; status?: number; error?: string }[] };
 
 export async function runAI<T>({ prompt, image, mimeType, fallback, trace }: { prompt: string; image?: ArrayBuffer; mimeType?: string; fallback?: T; trace?: AITrace }): Promise<T> {
   const runtime = await getRuntime();
+  // Leave enough time for storage and database work before a serverless request limit.
+  const deadline = Date.now() + (fallback === undefined ? 14_000 : 10_000);
   const errors: string[] = [];
   const geminiKeys = splitKeys(runtime.GEMINI_API_KEYS, runtime.GEMINI_API_KEY);
   const geminiModels = [...new Set(splitKeys(runtime.GEMINI_MODEL, "gemini-3.5-flash"))];
   for (const model of geminiModels) for (const key of geminiKeys) try {
-    let response = await geminiResponse(key, model, prompt, image, mimeType, true);
-    if (response.status === 400) response = await geminiResponse(key, model, prompt, image, mimeType, false);
+    let response = await geminiResponse(key, model, prompt, image, mimeType, true, attemptSignal(deadline));
+    if (response.status === 400) response = await geminiResponse(key, model, prompt, image, mimeType, false, attemptSignal(deadline));
     if (!response.ok) { errors.push(`Gemini ${model}: HTTP ${response.status}`); trace?.attempts.push({ provider: "gemini", model, status: response.status }); continue; }
     const body = await response.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }; const text = body.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || ""; const result = JSON.parse(stripJson(text)) as T; if (trace) trace.selected = { provider: "gemini", model }; return result;
   } catch (error) { const message = error instanceof Error ? error.message : "invalid response"; errors.push(`Gemini ${model}: ${message}`); trace?.attempts.push({ provider: "gemini", model, error: message }); }
@@ -138,8 +145,8 @@ export async function runAI<T>({ prompt, image, mimeType, fallback, trace }: { p
   const groqKeys = splitKeys(runtime.GROQ_API_KEYS, runtime.GROQ_API_KEY);
   const groqModels = [...new Set(splitKeys(runtime.GROQ_MODEL, "qwen/qwen3.6-27b"))];
   for (const model of groqModels) for (const key of groqKeys) try {
-    let response = await groqResponse(key, model, prompt, image, mimeType, true);
-    if (response.status === 400) response = await groqResponse(key, model, prompt, image, mimeType, false);
+    let response = await groqResponse(key, model, prompt, image, mimeType, true, attemptSignal(deadline));
+    if (response.status === 400) response = await groqResponse(key, model, prompt, image, mimeType, false, attemptSignal(deadline));
     if (!response.ok) { errors.push(`Groq ${model}: HTTP ${response.status}`); trace?.attempts.push({ provider: "groq", model, status: response.status }); continue; }
     const body = await response.json() as { choices?: { message?: { content?: string } }[] }; const result = JSON.parse(stripJson(body.choices?.[0]?.message?.content || "{}")) as T; if (trace) trace.selected = { provider: "groq", model }; return result;
   } catch (error) { const message = error instanceof Error ? error.message : "invalid response"; errors.push(`Groq ${model}: ${message}`); trace?.attempts.push({ provider: "groq", model, error: message }); }
@@ -149,10 +156,10 @@ export async function runAI<T>({ prompt, image, mimeType, fallback, trace }: { p
 }
 
 export async function runTextAI({ prompt }: { prompt: string }): Promise<string> {
-  const runtime = await getRuntime(); const errors: string[] = [];
+  const runtime = await getRuntime(); const errors: string[] = []; const deadline = Date.now() + 14_000;
   const geminiKeys = splitKeys(runtime.GEMINI_API_KEYS, runtime.GEMINI_API_KEY);
   for (const model of [...new Set(splitKeys(runtime.GEMINI_MODEL, "gemini-3.5-flash"))]) for (const key of geminiKeys) try {
-    const response = await geminiResponse(key, model, prompt);
+    const response = await geminiResponse(key, model, prompt, undefined, undefined, false, attemptSignal(deadline));
     if (!response.ok) { errors.push(`Gemini ${model}: HTTP ${response.status}`); continue; }
     const body = await response.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
     const text = body.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim(); if (text) return text;
@@ -161,7 +168,7 @@ export async function runTextAI({ prompt }: { prompt: string }): Promise<string>
 
   const groqKeys = splitKeys(runtime.GROQ_API_KEYS, runtime.GROQ_API_KEY);
   for (const model of [...new Set(splitKeys(runtime.GROQ_MODEL, "qwen/qwen3.6-27b"))]) for (const key of groqKeys) try {
-    const response = await groqResponse(key, model, prompt);
+    const response = await groqResponse(key, model, prompt, undefined, undefined, false, attemptSignal(deadline));
     if (!response.ok) { errors.push(`Groq ${model}: HTTP ${response.status}`); continue; }
     const body = await response.json() as { choices?: { message?: { content?: string } }[] };
     const text = body.choices?.[0]?.message?.content?.trim(); if (text) return text;

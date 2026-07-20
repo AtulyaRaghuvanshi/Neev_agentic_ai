@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseTodoLines, resolveEvidence, similarity, unlockNext } from "../lib/domain.ts";
 import { retrieveRules } from "../lib/rules.ts";
-import { parseDocumentLocally } from "../lib/document-parser.ts";
+import { mergeExtractedFields, parseDocumentLocally, sanitizeExtractedFields } from "../lib/document-parser.ts";
 
 test("fuzzy evidence matching tolerates a small spelling variation", () => {
   assert.ok(similarity("Shiva Kumar", "Siva Kumar") > 0.88);
@@ -37,6 +37,21 @@ test("open-source OCR text maps identity fields without an AI key", async () => 
   assert.equal(result.fields.date_of_birth, "01/02/2000");
   assert.equal(result.fields.document_number, "ABCDE1234F");
   assert.ok(result.confidence > 0.5);
+});
+
+test("PAN extraction rejects OCR label fragments and impossible dates", () => {
+  assert.deepEqual(sanitizeExtractedFields({ name: "Name Lar", date_of_birth: "Jog", guardian_name: "/ Father's Name उक्त रकम का", document_number: "GQHPR8016L", issuing_authority: "INCOME TAX DEPARTMENT GOVT. OF INDIA" }, "PAN card"), {
+    document_number: "GQHPR8016L",
+    issuing_authority: "INCOME TAX DEPARTMENT GOVT. OF INDIA",
+  });
+});
+
+test("vision fields take priority while valid OCR only fills omissions", () => {
+  assert.deepEqual(mergeExtractedFields({ name: "Ravi Kumar", date_of_birth: "17/07/2003" }, { name: "Name Lar", date_of_birth: "Jog", document_number: "GQHPR8016L" }, "PAN card"), {
+    document_number: "GQHPR8016L",
+    name: "Ravi Kumar",
+    date_of_birth: "17/07/2003",
+  });
 });
 
 test("plain LLM TODO output becomes concise pathway steps", () => {
