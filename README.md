@@ -119,9 +119,6 @@ credit limit: when it is exhausted, the project pauses instead of generating
 an automatic charge.
 
 ## Known limits
-
-- Seeded legal knowledge currently covers national Aadhaar/delayed-birth guidance and a Bihar residence flow, not every service in every state.
-- When no exact service/state rule matches, the fallback planner returns one constrained shortest-path checklist, marks it AI-generated, and refuses invented/local facts or URLs.
 - Exact Gram Panchayat/Tehsildar addresses are shown only when a trustworthy official locator supplies them.
 - No automatic appointment booking or reminders in the free MVP.
 - OCR/model confidence is advisory; users must confirm extracted facts.
